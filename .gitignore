@@ -1,0 +1,5 @@
+.token
+actions.db
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
