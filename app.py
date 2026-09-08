@@ -10,7 +10,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-TOKEN_FILE = Path(__file__).parent / ".token"
+TOKEN_FILE    = Path(__file__).parent / ".token"
+TOKEN_FILE_HS = Path(__file__).parent / ".token_hs"
 _LOGO = Path(__file__).parent / "logo.svg"
 
 # ── Brand CSS ──────────────────────────────────────────────────────────────
@@ -100,6 +101,20 @@ def save_token(t: str):
     TOKEN_FILE.write_text(t.strip())
 
 
+def load_hs_token() -> str:
+    try:
+        t = st.secrets.get("HUBSPOT_TOKEN", "")
+        if t:
+            return t.strip()
+    except Exception:
+        pass
+    return TOKEN_FILE_HS.read_text().strip() if TOKEN_FILE_HS.exists() else ""
+
+
+def save_hs_token(t: str):
+    TOKEN_FILE_HS.write_text(t.strip())
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────
 token = load_token()
 selected_markets = []
@@ -179,6 +194,27 @@ with st.sidebar:
             TOKEN_FILE.unlink(missing_ok=True)
             st.rerun()
 
+        st.divider()
+        st.caption("HubSpot · Funnel data")
+        hs_token = load_hs_token()
+        if not hs_token:
+            hs_in = st.text_input(
+                "HubSpot token", type="password",
+                help="HubSpot → Settings → Private Apps → Create app (contacts + deals read scopes)",
+                key="hs_token_input",
+            )
+            if st.button("Save HS token", use_container_width=True):
+                if hs_in.strip():
+                    save_hs_token(hs_in)
+                    st.rerun()
+                else:
+                    st.error("Token required")
+        else:
+            st.caption("✅ HubSpot connected")
+            if st.button("🔑 Change HS token", use_container_width=True):
+                TOKEN_FILE_HS.unlink(missing_ok=True)
+                st.rerun()
+
 
 # ── No-token landing ───────────────────────────────────────────────────────
 if not token:
@@ -198,8 +234,20 @@ if not token:
 
 # ── Imports (token exists) ─────────────────────────────────────────────────
 from meta_api import ACCOUNTS, ACCOUNT_CURRENCIES, get_account_data, get_adset_data, get_fx_rates
-from analysis import analyze_market, campaign_type
+from analysis import analyze_market, campaign_type, classify_product
 import state
+import json, os
+
+# ── DWH MQL lookup (refreshed by running Claude session) ──────────────────
+_DWH_MQL_PATH = os.path.join(os.path.dirname(__file__), "dwh_mqls.json")
+try:
+    with open(_DWH_MQL_PATH) as _f:
+        _dwh = json.load(_f)
+    DWH_MQLS: dict = _dwh.get("mqls_by_campaign", {})
+    DWH_MQL_DATE = _dwh.get("fetched_at", "?")
+except Exception:
+    DWH_MQLS = {}
+    DWH_MQL_DATE = None
 
 
 # ── Data fetching with caching ─────────────────────────────────────────────
@@ -528,7 +576,13 @@ def render_item(campaign: dict, item: dict, severity: str,
 
 # ── Tabs ───────────────────────────────────────────────────────────────────
 st.divider()
-t1, t2, t3 = st.tabs(["🚨 Flags & Opportunities", "📊 Market Snapshot", "📋 Action Log"])
+t1, t2, t3, t4, t5 = st.tabs([
+    "🚨 Flags & Opportunities",
+    "📊 Market Snapshot",
+    "📋 Action Log",
+    "🔭 Funnel — Colombia",
+    "🎨 Creative Intelligence",
+])
 
 
 # ── Tab 1: Flags & Opportunities ──────────────────────────────────────────
@@ -664,6 +718,8 @@ with t1:
 
 # ── Tab 2: Market Snapshot ────────────────────────────────────────────────
 with t2:
+    if DWH_MQL_DATE:
+        st.caption(f"MQLs column sourced from DWH · last refreshed {DWH_MQL_DATE} · YTD 2026")
     for market in selected_markets:
         mkt_camps = [c for c in all_view if c["market"] == market]
         if not mkt_camps:
@@ -694,11 +750,13 @@ with t2:
             elif c["opportunities"]:
                 status_str = "🚀 Opp"
 
+            mqls_dwh = DWH_MQLS.get(c["campaign_name"])
             rows.append({
                 "Campaign": c["campaign_name"][:50],
                 "Type":     campaign_type(c["campaign_name"]),
                 "Product":  c["product"],
                 "Leads":    c["leads"],
+                "MQLs":     mqls_dwh if mqls_dwh is not None else "—",
                 "CPL":      f"€{cpl:.2f}" if cpl else "—",
                 "WoW":      wow,
                 "Freq":     f"{c['frequency']:.1f}×" if c["frequency"] else "—",
@@ -790,3 +848,678 @@ with t3:
         st.info("No actions tracked yet. Mark flags and opportunities as done to log them here.")
 
     st.caption(f"{len(all_actions)} total actions in log")
+
+
+# ── Tab 4: Funnel — Colombia ───────────────────────────────────────────────────
+with t4:
+    from hubspot_api import get_co_funnel
+
+    CO_MARKET = "🇨🇴 Colombia"
+    hs_token  = load_hs_token()
+
+    if not hs_token:
+        st.info("Enter your HubSpot token in the sidebar to unlock funnel metrics.")
+    elif CO_MARKET not in selected_markets:
+        st.warning(f"Select **{CO_MARKET}** in the Markets filter to see funnel data.")
+    else:
+        # ── Spend by segment from Meta data ───────────────────────────────────
+        co_campaigns = [c for c in all_view if c["market"] == CO_MARKET]
+
+        def _co_segment(name: str) -> str:
+            n = name.lower()
+            if "fac" in n:
+                return "clinics_prs"
+            if "noa" in n:
+                return "individuals_noa"
+            return "individuals_agenda"
+
+        spend_by_seg = {"individuals_agenda": 0.0, "individuals_noa": 0.0, "clinics_prs": 0.0}
+        leads_by_seg = {"individuals_agenda": 0,   "individuals_noa": 0,   "clinics_prs": 0}
+        for c in co_campaigns:
+            seg = _co_segment(c["campaign_name"])
+            spend_by_seg[seg] += c["spend"]
+            leads_by_seg[seg] += c["leads"]
+
+        # ── Fetch HubSpot funnel (cached 1 h) ─────────────────────────────────
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def _fetch_funnel(tok, d_from, d_to):
+            return get_co_funnel(tok, d_from, d_to)
+
+        funnel_cache_key = f"funnel|{hs_token[:8]}|{start_date}|{end_date}"
+        if (
+            "funnel_result" not in st.session_state
+            or st.session_state.get("funnel_key") != funnel_cache_key
+            or refresh
+        ):
+            with st.spinner("Fetching HubSpot funnel data…"):
+                funnel_data, funnel_err = _fetch_funnel(
+                    hs_token, start_date.isoformat(), end_date.isoformat()
+                )
+            st.session_state["funnel_result"] = funnel_data
+            st.session_state["funnel_err"]    = funnel_err
+            st.session_state["funnel_key"]    = funnel_cache_key
+
+        funnel_data = st.session_state["funnel_result"]
+        funnel_err  = st.session_state["funnel_err"]
+
+        if funnel_err:
+            st.error(f"HubSpot error: {funnel_err}")
+        else:
+            FUNNEL_SEGS = [
+                ("individuals_agenda", "Individuals · Agenda Premium"),
+                ("individuals_noa",    "Individuals · NOA"),
+                ("clinics_prs",        "Clinics PRS · Clinic Agenda"),
+            ]
+            SEG_COLORS = {
+                "individuals_agenda": "#00A085",
+                "individuals_noa":    "#0077B6",
+                "clinics_prs":        "#9B59B6",
+            }
+
+            st.subheader("Colombia · Meta → HubSpot Funnel")
+            st.caption(
+                f"Period: {start_date.strftime('%b %d')} – {end_date.strftime('%b %d')}  ·  "
+                "30-day cohort  ·  MQL date = lcs_mql_at_test  ·  Spend in EUR  ·  "
+                "Deals = closed in period and associated with cohort contacts"
+            )
+
+            for seg_key, seg_label in FUNNEL_SEGS:
+                d     = funnel_data.get(seg_key, {})
+                spend = spend_by_seg.get(seg_key, 0.0)
+
+                mqls        = d.get("mqls", 0)
+                unqualified = d.get("unqualified", 0)
+                net_qual    = d.get("net_qualified", 0)
+                open_deals  = d.get("open_deals", 0)
+                wons        = d.get("wons", 0)
+
+                uq_rate      = unqualified / mqls * 100      if mqls      else 0
+                raw_cpl      = spend / mqls                  if mqls      else 0
+                real_cpl     = spend / net_qual              if net_qual  else 0
+                deal_open_rt = open_deals / net_qual * 100   if net_qual  else 0
+                won_rt       = wons / net_qual * 100         if net_qual  else 0
+                cac          = spend / wons                  if wons      else 0
+
+                color = SEG_COLORS.get(seg_key, "#00A085")
+                st.markdown(
+                    f"<div style='border-left:4px solid {color};"
+                    f"padding-left:12px;margin-bottom:4px'>"
+                    f"<strong>{seg_label}</strong></div>",
+                    unsafe_allow_html=True,
+                )
+
+                c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+                c1.metric("Meta Spend",    f"€{spend:,.0f}")
+                c2.metric("Meta Leads",    f"{leads_by_seg.get(seg_key, 0):,}")
+                c3.metric("HS MQLs",       f"{mqls:,}")
+                c4.metric("Unqualified",   f"{unqualified:,}",
+                          delta=f"{uq_rate:.0f}% rate", delta_color="inverse")
+                c5.metric("Net Qual MQLs", f"{net_qual:,}")
+                c6.metric("Real CPL",
+                          f"€{real_cpl:,.0f}" if real_cpl else "—",
+                          delta=f"raw €{raw_cpl:,.0f}" if raw_cpl else None,
+                          delta_color="inverse")
+                c7.metric("Open Deals",    f"{open_deals:,}",
+                          delta=f"{deal_open_rt:.0f}% of net MQLs" if deal_open_rt else None,
+                          delta_color="off")
+                c8.metric("WONs / CAC",
+                          f"{wons}  ·  €{cac:,.0f}" if wons else f"{wons}",
+                          delta=f"{won_rt:.1f}% CVR" if won_rt else None,
+                          delta_color="off")
+                st.divider()
+
+            summary_rows = []
+            for seg_key, seg_label in FUNNEL_SEGS:
+                d     = funnel_data.get(seg_key, {})
+                spend = spend_by_seg.get(seg_key, 0.0)
+                mqls        = d.get("mqls", 0)
+                net_qual    = d.get("net_qualified", 0)
+                unqualified = d.get("unqualified", 0)
+                open_deals  = d.get("open_deals", 0)
+                wons        = d.get("wons", 0)
+                summary_rows.append({
+                    "Segment":    seg_label,
+                    "Spend €":    f"€{spend:,.0f}",
+                    "Meta Leads": leads_by_seg.get(seg_key, 0),
+                    "HS MQLs":    mqls,
+                    "Unqual":     unqualified,
+                    "Unqual %":   f"{unqualified/mqls*100:.0f}%" if mqls else "—",
+                    "Net Qual":   net_qual,
+                    "Raw CPL €":  f"€{spend/mqls:,.0f}" if mqls else "—",
+                    "Real CPL €": f"€{spend/net_qual:,.0f}" if net_qual else "—",
+                    "Open Deals": open_deals,
+                    "Deal Open %":f"{open_deals/net_qual*100:.0f}%" if net_qual else "—",
+                    "WONs":       wons,
+                    "WON CVR %":  f"{wons/net_qual*100:.1f}%" if net_qual else "—",
+                    "CAC €":      f"€{spend/wons:,.0f}" if wons else "—",
+                })
+            if summary_rows:
+                st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+            st.caption(
+                "⚠️ MQL counts: contacts where utm_campaign = Colombia Meta campaign "
+                "AND lcs_mql_at_test in period — precise Meta attribution.  "
+                "Deal counts: deals associated with those same contacts, closed in the period "
+                "(deduped). Open deals = currently open pipeline deals for those contacts."
+            )
+
+
+# ── Tab 5: Creative Intelligence ───────────────────────────────────────────────
+with t5:
+    from meta_api import get_ad_creative_data
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _fetch_ads(account_id, tok, since, until):
+        return get_ad_creative_data(account_id, tok, since, until)
+
+    def _v(arr):
+        """Extract float from Meta action-value array."""
+        try:
+            return float((arr or [{}])[0].get("value", 0)) or None
+        except Exception:
+            return None
+
+    def _act(actions, atype):
+        for a in (actions or []):
+            if a.get("action_type") == atype:
+                try:
+                    return float(a["value"])
+                except Exception:
+                    return 0.0
+        return 0.0
+
+    _RANK = {
+        "ABOVE_AVERAGE":    "🟢",
+        "BELOW_AVERAGE_35": "🟡",
+        "BELOW_AVERAGE_20": "🔴",
+        "BELOW_AVERAGE_10": "🔴",
+        "UNKNOWN":          "—",
+    }
+
+    # ── Fetch ad data for selected markets ─────────────────────────────────────
+    all_ads, ad_errors = [], []
+    ad_pb = st.progress(0, "Fetching creative data…")
+    for i, market in enumerate(selected_markets):
+        ad_pb.progress(i / max(len(selected_markets), 1), f"Fetching ads · {market}…")
+        account_id = ACCOUNTS[market]
+        currency   = ACCOUNT_CURRENCIES.get(market, "EUR")
+        raw, err   = _fetch_ads(account_id, token, start_date.isoformat(), end_date.isoformat())
+        if err:
+            ad_errors.append(f"{market}: {err}")
+            continue
+        converted = _convert_to_eur(raw, currency, _fetch_fx())
+        for ad in converted:
+            ad["_market"] = market
+        all_ads.extend(converted)
+    ad_pb.empty()
+
+    if ad_errors:
+        st.warning("Errors: " + " | ".join(ad_errors))
+
+    # ── Parse rows ─────────────────────────────────────────────────────────────
+    rows = []
+    for ad in all_ads:
+        cname = ad.get("campaign_name", "")
+        n = cname.lower()
+        # Only show actual lead gen campaigns (must contain mql or mal) — filters out boosted posts
+        if "mql" not in n and "mal" not in n:
+            continue
+        if not _passes({"product": classify_product(cname), "campaign_name": cname}):
+            continue
+
+        imp      = float(ad.get("impressions", 0) or 0)
+        spend    = float(ad.get("spend", 0) or 0)
+        if spend <= 0:
+            continue
+        freq     = float(ad.get("frequency", 0) or 0)
+        all_ctr  = float(ad.get("ctr", 0) or 0)
+
+        actions     = ad.get("actions", [])
+        leads       = _act(actions, "lead")
+        lpv         = _act(actions, "landing_page_view")
+        link_clicks = _act(actions, "link_click")
+
+        # 3-second video views come from the actions array, not a separate field
+        p3        = _act(actions, "video_view") or None
+        p50       = _v(ad.get("video_p50_watched_actions"))
+        thruplay  = _v(ad.get("video_thruplay_watched_actions"))
+        outbound  = _v(ad.get("outbound_clicks"))
+
+        cpl            = spend / leads     if leads           else None
+        hook_rate      = (p3  / imp  * 100)  if p3  and imp  else None
+        hold_rate      = (p50 / p3   * 100)  if p50 and p3   else None
+        thumb_stop     = (hook_rate * hold_rate / 100) if hook_rate and hold_rate else None
+        out_ctr        = (outbound / imp * 100) if outbound and imp else None
+        cost_per_tp    = (spend / thruplay) if thruplay else None
+
+        # Instant Form ads have no landing page — LPV events are never fired.
+        # Detect by: "instant" in ad/campaign name, OR lpv=0 while leads>0 and clicks>0.
+        is_instant_form = (
+            "instant" in ad.get("ad_name", "").lower() or
+            "instant" in cname.lower() or
+            (leads > 0 and link_clicks > 0 and lpv == 0)
+        )
+        if is_instant_form:
+            # Form Completion Rate: what % of form-opens led to a submission
+            lpv_rate      = None
+            form_fill_rate = (leads / link_clicks * 100) if leads and link_clicks else None
+        else:
+            lpv_rate       = (lpv / link_clicks * 100) if lpv and link_clicks else None
+            form_fill_rate = None
+
+        # Fatigue prediction: days until frequency reaches 5× at current burn rate
+        period_days = max((end_date - start_date).days, 1)
+        freq_per_day = freq / period_days if freq else 0
+        if freq >= 5:
+            days_to_fatigue = 0
+        elif freq_per_day > 0:
+            days_to_fatigue = round((5.0 - freq) / freq_per_day)
+        else:
+            days_to_fatigue = None
+
+        ad_name_full = ad.get("ad_name", "")
+        # Strip the campaign prefix so the Ad column shows only the distinguishing suffix
+        # e.g. "de_doc_mql_noa_meta_instant-form_broad_v1" → "instant-form_broad_v1"
+        if ad_name_full.lower().startswith(cname.lower()):
+            ad_display = ad_name_full[len(cname):].lstrip("_- ") or ad_name_full
+        else:
+            ad_display = ad_name_full
+
+        rows.append({
+            "Market":         ad["_market"],
+            "Campaign":       cname,
+            "Ad":             ad_display,
+            "Ad (full)":      ad_name_full,
+            "Format":         "🎬 Video" if p3 is not None else "🖼️ Image",
+            "Spend":          spend,
+            "Leads":          int(leads),
+            "CPL":            cpl,
+            "Hook Rate":      hook_rate,
+            "Hold Rate":      hold_rate,
+            "Thumb-Stop":     thumb_stop,
+            "Cost/ThruPlay":  cost_per_tp,
+            "LPV Rate":       lpv_rate,
+            "Form Fill %":    form_fill_rate,
+            "Out CTR":        out_ctr,
+            "All CTR":        all_ctr or None,
+            "Frequency":      freq or None,
+            "Fatigue In":     days_to_fatigue,
+            "Quality":        _RANK.get(ad.get("quality_ranking"), "—"),
+            "Engagement":     _RANK.get(ad.get("engagement_rate_ranking"), "—"),
+            "Conversion":     _RANK.get(ad.get("conversion_rate_ranking"), "—"),
+        })
+
+    if not rows:
+        st.info("No ad-level data for the selected markets and period.")
+
+    if rows:
+        df_ads = pd.DataFrame(rows).sort_values("CPL", ascending=True, na_position="last")
+
+        # ── Summary strip ──────────────────────────────────────────────────────
+        n_ads     = len(df_ads)
+        n_video   = (df_ads["Format"] == "🎬 Video").sum()
+        avg_hook  = df_ads["Hook Rate"].dropna().mean()
+        avg_cpl   = df_ads.loc[df_ads["Leads"] > 0, "CPL"].mean()
+        tot_spend = df_ads["Spend"].sum()
+        tot_leads = df_ads["Leads"].sum()
+
+        sc = st.columns(6)
+        sc[0].metric("Active Ads",    n_ads)
+        sc[1].metric("Video / Image", f"{n_video} / {n_ads - n_video}")
+        sc[2].metric("Avg Hook Rate", f"{avg_hook:.1f}%" if pd.notna(avg_hook) else "—",
+                     help="Avg across video ads only")
+        sc[3].metric("Avg CPL",       f"€{avg_cpl:,.0f}" if pd.notna(avg_cpl) else "—")
+        sc[4].metric("Total Leads",   f"{tot_leads:,}")
+        sc[5].metric("Total Spend",   f"€{tot_spend:,.0f}")
+
+        st.divider()
+
+        # ── Insights & recommendations ────────────────────────────────────────
+        G = "background-color:#d1f2e5;color:#0a5c36"
+        Y = "background-color:#fff8cc;color:#7d5a00"
+        R = "background-color:#ffd5d5;color:#8b0000"
+        N = "background-color:#f0f0f0;color:#888888"
+
+        has_leads  = df_ads[df_ads["Leads"] > 0].copy()
+        video_df   = df_ads[df_ads["Format"] == "🎬 Video"].copy()
+        image_df   = df_ads[df_ads["Format"] == "🖼️ Image"].copy()
+        avg_cpl_v  = avg_cpl if pd.notna(avg_cpl) else 0
+
+        alerts, recs = [], []
+
+        # Scale signals: CPL ≤80% of avg, freq <3
+        # Split: ads with dead hook (<15%) need creative fix first, not budget scale
+        if avg_cpl_v:
+            scale_candidates = has_leads[
+                (has_leads["CPL"] <= avg_cpl_v * 0.80) &
+                (has_leads["Frequency"].fillna(0) < 3)
+            ]
+            for _, r in scale_candidates.head(3).iterrows():
+                hook = r.get("Hook Rate")
+                has_dead_hook = pd.notna(hook) and hook < 15
+                if has_dead_hook:
+                    recs.append(
+                        f"🛠️ **Fix hook, then scale** — `{r['Ad (full)']}` · CPL €{r['CPL']:.0f} "
+                        f"({(1 - r['CPL']/avg_cpl_v)*100:.0f}% below avg) but hook only {hook:.1f}%. "
+                        "CPL is good despite a weak hook — replacing the opening frame could make it even cheaper. "
+                        "Test a new thumbnail/first 2s first, then scale the winner."
+                    )
+                else:
+                    recs.append(
+                        f"🚀 **Scale now** — `{r['Ad (full)']}` · CPL €{r['CPL']:.0f} "
+                        f"({(1 - r['CPL']/avg_cpl_v)*100:.0f}% below avg), freq {r['Frequency']:.1f}×. "
+                        "Increase budget 20–30% every 48 h while CPL holds."
+                    )
+
+        # Creative fatigue: already at/above threshold
+        for _, r in df_ads[df_ads["Frequency"].fillna(0) >= 5].iterrows():
+            alerts.append(
+                f"🔴 **Creative fatigue NOW** — `{r['Ad (full)']}` · freq {r['Frequency']:.1f}×. "
+                "Pause and replace immediately."
+            )
+
+        # Dead hook: hook <15%
+        for _, r in video_df[video_df["Hook Rate"].fillna(100) < 15].head(3).iterrows():
+            alerts.append(
+                f"🔴 **Dead hook** — `{r['Ad (full)']}` · hook {r['Hook Rate']:.1f}%. "
+                "The first frame isn't stopping the scroll — test a new thumbnail or opening shot."
+            )
+
+        # Good hook but bad hold: hook ≥25% AND hold <25%
+        for _, r in video_df[
+            (video_df["Hook Rate"].fillna(0) >= 25) &
+            (video_df["Hold Rate"].fillna(100) < 25)
+        ].head(2).iterrows():
+            alerts.append(
+                f"🟡 **Hook ✓ / Script ✗** — `{r['Ad (full)']}` · hook {r['Hook Rate']:.1f}% "
+                f"but hold {r['Hold Rate']:.1f}%. "
+                "The opening works — tighten or trim the middle of the video."
+            )
+
+        # Format CPL comparison
+        v_cpl = video_df[video_df["Leads"] > 0]["CPL"].mean() if not video_df.empty else None
+        i_cpl = image_df[image_df["Leads"] > 0]["CPL"].mean() if not image_df.empty else None
+        if pd.notna(v_cpl) and pd.notna(i_cpl):
+            if v_cpl < i_cpl * 0.85:
+                recs.append(
+                    f"📹 **Shift budget to video** — video CPL €{v_cpl:.0f} vs image €{i_cpl:.0f} "
+                    f"({(i_cpl/v_cpl - 1)*100:.0f}% cheaper). Reduce image adset budgets first."
+                )
+            elif i_cpl < v_cpl * 0.85:
+                recs.append(
+                    f"🖼️ **Shift budget to image** — image CPL €{i_cpl:.0f} vs video €{v_cpl:.0f} "
+                    f"({(v_cpl/i_cpl - 1)*100:.0f}% cheaper). Reduce video adset budgets first."
+                )
+
+        # Low LPV rate
+        low_lpv = df_ads[df_ads["LPV Rate"].fillna(100) < 50]
+        if not low_lpv.empty:
+            alerts.append(
+                f"🟡 **Landing page friction** — {len(low_lpv)} ad(s) with LPV Rate <50%. "
+                "Over half of clickers never reach the page — check load speed, redirects, and mobile UX."
+            )
+
+        # Quality/conversion ranking issues
+        bad_quality = df_ads[df_ads["Quality"] == "🔴"]
+        if not bad_quality.empty:
+            alerts.append(
+                f"🔴 **Quality ranking below avg** on {len(bad_quality)} ad(s) — "
+                "Meta is discounting these in auction. Review post-click experience and reduce negative feedback."
+            )
+        bad_conv = df_ads[(df_ads["Conversion"] == "🔴") & (df_ads["Leads"] > 0)]
+        if not bad_conv.empty:
+            alerts.append(
+                f"🔴 **Conversion ranking below avg** on {len(bad_conv)} ad(s) — "
+                "Good CTR but low conversion. Landing page offer/form friction is the likely culprit."
+            )
+
+        # High CPL with spend > €100
+        high_cpl = df_ads[
+            df_ads["CPL"].fillna(0) > avg_cpl_v * 1.5
+        ] if avg_cpl_v else pd.DataFrame()
+        if not high_cpl.empty:
+            for _, r in high_cpl[high_cpl["Spend"] > 100].head(2).iterrows():
+                recs.append(
+                    f"⛔ **Kill or test** — `{r['Ad (full)']}` · CPL €{r['CPL']:.0f} "
+                    f"({(r['CPL']/avg_cpl_v - 1)*100:.0f}% above avg). "
+                    "Pause unless testing — budget is better deployed on performers."
+                )
+
+        if alerts or recs:
+            ia_col, rec_col = st.columns(2)
+            with ia_col:
+                st.markdown("##### ⚠️ Alerts")
+                for a in alerts:
+                    st.markdown(a)
+            with rec_col:
+                st.markdown("##### 🎯 Recommendations")
+                for r in recs:
+                    st.markdown(r)
+            if not recs:
+                rec_col.caption("No scale or kill actions triggered yet.")
+            if not alerts:
+                ia_col.success("✅ No critical issues detected.")
+
+        # ── Fatigue Forecast ──────────────────────────────────────────────────
+        fatigue_df = df_ads[df_ads["Fatigue In"].notna()].copy()
+        fatigue_df = fatigue_df.sort_values("Fatigue In")
+        urgent   = fatigue_df[fatigue_df["Fatigue In"] <= 7]
+        warning  = fatigue_df[(fatigue_df["Fatigue In"] > 7) & (fatigue_df["Fatigue In"] <= 14)]
+        healthy  = fatigue_df[fatigue_df["Fatigue In"] > 14]
+
+        if not fatigue_df.empty:
+            with st.expander(
+                f"⏳ Fatigue Forecast — {len(urgent)} urgent · {len(warning)} watch · {len(healthy)} healthy",
+                expanded=bool(len(urgent))
+            ):
+                st.caption(
+                    "Predicts days until frequency hits 5× at the current burn rate. "
+                    "🔴 ≤7 days — brief creatives now.  🟡 8–14 days — start briefing.  🟢 >14 days — healthy."
+                )
+                forecast_rows = []
+                for _, r in fatigue_df.iterrows():
+                    d = int(r["Fatigue In"])
+                    if d <= 0:
+                        status, eta = "🔴 Fatigued", "Now"
+                    elif d <= 7:
+                        status, eta = "🔴 Urgent", f"{d}d"
+                    elif d <= 14:
+                        status, eta = "🟡 Brief team", f"{d}d"
+                    else:
+                        status, eta = "🟢 Healthy", f"{d}d"
+                    forecast_rows.append({
+                        "Ad":           r["Ad (full)"],
+                        "Market":       r["Market"],
+                        "Freq now":     f"{r['Frequency']:.1f}×" if pd.notna(r.get("Frequency")) else "—",
+                        "Days to 5×":   eta,
+                        "Status":       status,
+                        "Spend":        f"€{r['Spend']:.0f}",
+                        "CPL":          f"€{r['CPL']:.0f}" if pd.notna(r.get("CPL")) else "—",
+                    })
+                st.dataframe(
+                    pd.DataFrame(forecast_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        st.divider()
+
+        # ── Color-coded table ─────────────────────────────────────────────────
+        # Allow long ad names to wrap inside cells instead of clipping
+        st.markdown(
+            "<style>"
+            ".stDataFrame [data-testid='stDataFrameResizable'] td { white-space: pre-wrap !important; word-break: break-all; }"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "🟢 Good  🟡 Watch  🔴 Act  ⬜ N/A  |  "
+            "Hover column headers for definitions. "
+            "Hook/Hold/LPV only for video ads."
+        )
+
+        def _s(val, fn):
+            try:
+                return fn(val)
+            except Exception:
+                return ""
+
+        def _hook_color(v):
+            if pd.isna(v): return N
+            return G if v >= 25 else (Y if v >= 15 else R)
+
+        def _hold_color(v):
+            if pd.isna(v): return N
+            return G if v >= 40 else (Y if v >= 25 else R)
+
+        def _lpv_color(v):
+            if pd.isna(v): return N
+            return G if v >= 70 else (Y if v >= 50 else R)
+
+        def _cpl_color(v):
+            if pd.isna(v) or not avg_cpl_v: return ""
+            return G if v <= avg_cpl_v * 0.80 else (Y if v <= avg_cpl_v * 1.20 else R)
+
+        def _thumb_color(v):
+            if pd.isna(v): return N
+            return G if v >= 10 else (Y if v >= 5 else R)
+
+        def _tp_color(v):
+            if pd.isna(v): return N
+            return G if v <= 0.5 else (Y if v <= 1.5 else R)
+
+        def _fatigue_color(v):
+            if pd.isna(v): return ""
+            return R if v <= 7 else (Y if v <= 14 else G)
+
+        def _freq_color(v):
+            if pd.isna(v): return ""
+            return G if v < 3 else (Y if v < 5 else R)
+
+        def _rank_color(v):
+            return {"🟢": G, "🟡": Y, "🔴": R}.get(v, N)
+
+        _style_map = [
+            (_hook_color,   ["Hook Rate"]),
+            (_hold_color,   ["Hold Rate"]),
+            (_thumb_color,  ["Thumb-Stop"]),
+            (_tp_color,     ["Cost/ThruPlay"]),
+            (_lpv_color,    ["LPV Rate", "Form Fill %"]),
+            (_cpl_color,    ["CPL"]),
+            (_freq_color,   ["Frequency"]),
+            (_fatigue_color,["Fatigue In"]),
+            (_rank_color,   ["Quality", "Engagement", "Conversion"]),
+        ]
+        try:
+            styled = df_ads.style
+            for fn, cols in _style_map:
+                existing = [c for c in cols if c in df_ads.columns]
+                if existing:
+                    styled = styled.map(fn, subset=existing)
+        except AttributeError:
+            styled = df_ads.style
+            for fn, cols in _style_map:
+                existing = [c for c in cols if c in df_ads.columns]
+                if existing:
+                    styled = styled.applymap(fn, subset=existing)
+
+        _visible_cols = [c for c in df_ads.columns if c != "Ad (full)"]
+        st.dataframe(
+            styled,
+            hide_index=True,
+            use_container_width=True,
+            column_order=_visible_cols,
+            column_config={
+                "Market":   st.column_config.TextColumn("Market", width="small"),
+                "Campaign": st.column_config.TextColumn("Campaign", width="medium"),
+                "Ad":       st.column_config.TextColumn("Ad variant (campaign prefix stripped)", width="large"),
+                "Format":   st.column_config.TextColumn("Format", width="small"),
+                "Spend": st.column_config.NumberColumn(
+                    "Spend €", format="€%.0f",
+                    help="Total spend in the period, converted to EUR.",
+                ),
+                "Leads": st.column_config.NumberColumn("Leads", width="small"),
+                "CPL": st.column_config.NumberColumn(
+                    "CPL €", format="€%.0f",
+                    help="Cost Per Lead = Spend ÷ Leads. 🟢 ≤80% of avg  🟡 80–120%  🔴 >120%",
+                ),
+                "Hook Rate": st.column_config.NumberColumn(
+                    "Hook Rate %",
+                    help="3-second video views ÷ Impressions. Measures if the first frame stops the scroll. "
+                         "🟢 ≥25%  🟡 15–25%  🔴 <15%",
+                    format="%.1f%%",
+                ),
+                "Hold Rate": st.column_config.NumberColumn(
+                    "Hold Rate %",
+                    help="50%-through views ÷ 3-second views. Measures narrative retention after the hook. "
+                         "🟢 ≥40%  🟡 25–40%  🔴 <25%",
+                    format="%.1f%%",
+                ),
+                "Thumb-Stop": st.column_config.NumberColumn(
+                    "Thumb-Stop",
+                    help="Hook Rate × Hold Rate ÷ 100. Compound signal: % of impressions that resulted in "
+                         "someone watching at least 50% of the video. Best single number for creative quality. "
+                         "🟢 ≥10%  🟡 5–10%  🔴 <5%",
+                    format="%.1f%%",
+                ),
+                "Cost/ThruPlay": st.column_config.NumberColumn(
+                    "Cost/ThruPlay",
+                    help="Spend ÷ ThruPlays. ThruPlay = watched 15+ seconds or full video (whichever is shorter). "
+                         "Upper-funnel video quality signal — high cost = Meta isn't serving this to engaged audiences. "
+                         "🟢 ≤€0.50  🟡 €0.50–€1.50  🔴 >€1.50",
+                    format="€%.2f",
+                ),
+                "LPV Rate": st.column_config.NumberColumn(
+                    "LPV Rate %",
+                    help="Landing Page Views ÷ Link Clicks. Only shown for LP (non-Instant-Form) ads. "
+                         "Measures friction between ad click and page load. "
+                         "🟢 ≥70%  🟡 50–70%  🔴 <50%  (low = slow page, broken redirect, or mobile UX issue)",
+                    format="%.1f%%",
+                ),
+                "Form Fill %": st.column_config.NumberColumn(
+                    "Form Fill %",
+                    help="Leads ÷ Link Clicks. Only shown for Instant Form ads (form opens inside Meta — no LP). "
+                         "Measures what % of people who opened the form actually submitted it. "
+                         "🟢 ≥70%  🟡 50–70%  🔴 <50%  (low = form is too long, too many fields, or poor pre-fill)",
+                    format="%.1f%%",
+                ),
+                "Out CTR": st.column_config.NumberColumn(
+                    "Outbound CTR",
+                    help="Outbound clicks ÷ Impressions. Real intent signal — excludes reactions/profile visits.",
+                    format="%.2f%%",
+                ),
+                "All CTR": st.column_config.NumberColumn(
+                    "All CTR",
+                    help="All clicks ÷ Impressions. Compare vs Outbound CTR to spot vanity engagement.",
+                    format="%.2f%%",
+                ),
+                "Frequency": st.column_config.NumberColumn(
+                    "Freq",
+                    help="Avg times one person saw this ad. 🟢 <3  🟡 3–5  🔴 ≥5 (creative fatigue)",
+                    format="%.1f×",
+                ),
+                "Fatigue In": st.column_config.NumberColumn(
+                    "Fatigue In",
+                    help="Predicted days until frequency hits 5× at the current burn rate. "
+                         "🔴 ≤7 days — brief creatives now  🟡 8–14 days — start briefing  🟢 >14 days — healthy. "
+                         "Formula: (5 − current freq) ÷ (freq per day in this period).",
+                    format="%d days",
+                ),
+                "Quality": st.column_config.TextColumn(
+                    "Quality",
+                    help="Meta's Quality Ranking vs auction competitors. Based on post-click UX & ad feedback. "
+                         "🟢 Above avg  🟡 Below 35%  🔴 Bottom 10–20%  ⬜ insufficient data",
+                    width="small",
+                ),
+                "Engagement": st.column_config.TextColumn(
+                    "Engage",
+                    help="Meta's Engagement Rate Ranking. Expected likes/comments/shares vs similar ads.",
+                    width="small",
+                ),
+                "Conversion": st.column_config.TextColumn(
+                    "Conv.",
+                    help="Meta's Conversion Rate Ranking. Low here + high CTR = landing page problem.",
+                    width="small",
+                ),
+            },
+        )

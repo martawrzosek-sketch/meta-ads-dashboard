@@ -99,6 +99,43 @@ def get_adset_data(account_id: str, campaign_id: str, token: str, since: str, un
         return [], str(e)
 
 
+_CREATIVE_FIELDS = ",".join([
+    "ad_id", "ad_name", "campaign_id", "campaign_name", "adset_id", "adset_name",
+    "spend", "impressions", "frequency", "ctr", "cpm",
+    "cost_per_result", "results", "actions",
+    "video_p25_watched_actions", "video_p50_watched_actions",
+    "video_thruplay_watched_actions",
+    "video_avg_time_watched_actions", "outbound_clicks",
+    "quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking",
+])
+
+
+def get_ad_creative_data(account_id: str, token: str, since: str, until: str):
+    """Fetch ad-level insights with creative performance metrics."""
+    url = f"{BASE_URL}/act_{account_id}/insights"
+    params = {
+        "access_token": token,
+        "fields": _CREATIVE_FIELDS,
+        "level": "ad",
+        "time_range": json.dumps({"since": since, "until": until}),
+        "filtering": json.dumps([{"field": "spend", "operator": "GREATER_THAN", "value": "0"}]),
+        "limit": 200,
+    }
+    all_data = []
+    try:
+        while url:
+            r = requests.get(url, params=params, timeout=30)
+            body = r.json()
+            if "error" in body:
+                return [], body["error"].get("message", "API error")
+            all_data.extend(body.get("data", []))
+            url = body.get("paging", {}).get("next")
+            params = {}
+        return all_data, None
+    except Exception as e:
+        return [], str(e)
+
+
 def get_account_data(market: str, token: str, since: str, until: str):
     account_id = ACCOUNTS[market]
     data, error = _fetch_insights(account_id, token, since, until)
